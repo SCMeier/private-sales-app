@@ -178,6 +178,15 @@ def month_label_from_df(df):
     return ""
 
 
+def calc_profit_pct(profit_series, boxoffice_series):
+    profit = pd.to_numeric(profit_series, errors="coerce").fillna(0.0)
+    box = pd.to_numeric(boxoffice_series, errors="coerce").fillna(0.0)
+    result = pd.Series(0.0, index=box.index if hasattr(box, "index") else None)
+    nonzero = box != 0
+    result.loc[nonzero] = profit.loc[nonzero] / box.loc[nonzero]
+    return result
+
+
 # =========================================================
 # INITIAL LOAD
 # =========================================================
@@ -316,12 +325,33 @@ if raw_df is not None:
             .astype(str)
             .str.strip()
             .tolist()
-        )
-        - {""}
+        ) - {""}
     )
 
     if unknown_codes:
         st.warning(f"Unknown Broker Codes Found: {', '.join(unknown_codes)}")
+
+        with st.expander("Add Missing Broker Codes", expanded=False):
+            st.write("Enter broker company names for the missing codes below. Then download the CSV snippet and add those rows to `broker_map.csv` in GitHub.")
+
+            missing_broker_rows = []
+            for code in unknown_codes:
+                company_name = st.text_input(f"Broker company for code {code}", key=f"missing_broker_{code}")
+                missing_broker_rows.append({
+                    "Broker Company": company_name.strip(),
+                    "Broker Code": code
+                })
+
+            missing_broker_df = pd.DataFrame(missing_broker_rows)
+
+            st.dataframe(missing_broker_df, use_container_width=True)
+
+            st.download_button(
+                "Download Missing Broker CSV",
+                data=df_to_csv_download(missing_broker_df),
+                file_name="missing_broker_codes.csv",
+                mime="text/csv"
+            )
 
     # Event defaults
     event_defaults = (
@@ -437,6 +467,11 @@ if raw_df is not None:
         - event_summary["Flipper_Fees"]
     )
 
+    event_summary["Profit %"] = calc_profit_pct(
+        event_summary["Total Company Profit"],
+        event_summary["Total_BoxOffice"]
+    )
+
     event_summary = event_summary.rename(columns={
         "Broker_Code": "Broker Code",
         "Broker_Company": "Broker Company",
@@ -463,8 +498,13 @@ if raw_df is not None:
             "Flipper Fees",
             "UF Ticket Fee",
             "Total Company Profit",
+            "Profit %",
         ]
     ].copy()
+
+    total_boxoffice = event_summary_display["Total BoxOffice"].sum()
+    total_profit = event_summary_display["Total Company Profit"].sum()
+    grand_profit_pct = (total_profit / total_boxoffice) if total_boxoffice != 0 else 0.0
 
     totals_row = pd.DataFrame([{
         "Event Name": "GRAND TOTAL",
@@ -475,12 +515,13 @@ if raw_df is not None:
         "Sales Date": "",
         "Orders": event_summary_display["Orders"].sum(),
         "Quantity": event_summary_display["Quantity"].sum(),
-        "Total BoxOffice": event_summary_display["Total BoxOffice"].sum(),
+        "Total BoxOffice": total_boxoffice,
         "Broker Fees": event_summary_display["Broker Fees"].sum(),
         "Overs": event_summary_display["Overs"].sum(),
         "Flipper Fees": event_summary_display["Flipper Fees"].sum(),
         "UF Ticket Fee": event_summary_display["UF Ticket Fee"].sum(),
-        "Total Company Profit": event_summary_display["Total Company Profit"].sum(),
+        "Total Company Profit": total_profit,
+        "Profit %": grand_profit_pct,
     }])
 
     event_summary_download = pd.concat(
@@ -585,6 +626,11 @@ if raw_df is not None:
         how="left"
     )
 
+    broker_summary["Profit %"] = calc_profit_pct(
+        broker_summary["Total Company Profit"],
+        broker_summary["Total BoxOffice"]
+    )
+
     broker_summary = broker_summary[
         [
             "Broker Code",
@@ -598,6 +644,7 @@ if raw_df is not None:
             "Flipper Fees",
             "UF Ticket Fee",
             "Total Company Profit",
+            "Profit %",
         ]
     ].copy()
 
@@ -662,12 +709,13 @@ if raw_df is not None:
     # DASHBOARD
     # =========================================================
     st.markdown("### Dashboard Totals")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total BoxOffice", f"{event_summary_display['Total BoxOffice'].sum():,.2f}")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Total BoxOffice", f"{total_boxoffice:,.2f}")
     c2.metric("Broker Fees", f"{event_summary_display['Broker Fees'].sum():,.2f}")
     c3.metric("Overs", f"{event_summary_display['Overs'].sum():,.2f}")
     c4.metric("Flipper Fees", f"{event_summary_display['Flipper Fees'].sum():,.2f}")
-    c5.metric("Company Profit", f"{event_summary_display['Total Company Profit'].sum():,.2f}")
+    c5.metric("Company Profit", f"{total_profit:,.2f}")
+    c6.metric("Profit %", f"{grand_profit_pct:.2%}")
 
     # =========================================================
     # DOWNLOADS
