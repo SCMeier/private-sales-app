@@ -13,7 +13,7 @@ SAVED_MONTHS_DIR = Path("saved_months")
 BROKER_MAP_FILE = Path("broker_map.csv")
 
 st.title(APP_TITLE)
-st.write("Upload the full Uflip purchases CSV. The app will automatically keep only rows whose Event Name starts with PV.")
+st.write("Private Sales dashboard. The app auto-loads the latest saved month if one exists.")
 
 
 # =========================================================
@@ -193,16 +193,26 @@ def calc_profit_pct(profit_series, boxoffice_series):
 ensure_saved_months_dir()
 broker_map_df = load_broker_map()
 
-source_choice = st.radio(
-    "Choose source",
-    ["Upload new monthly file", "Use a stored month"],
-    horizontal=True
-)
-
 raw_df = None
 raw_source_name = None
 
-if source_choice == "Upload new monthly file":
+saved_files = list_saved_month_files()
+
+# Auto-load latest saved month first
+if saved_files:
+    latest_file = saved_files[-1]
+    latest_path = SAVED_MONTHS_DIR / latest_file.name
+
+    try:
+        with open(latest_path, "rb") as f:
+            raw_df = read_full_uplift_csv(f)
+        raw_source_name = latest_file.name
+        st.success(f"Auto-loaded latest saved month: {latest_file.name}")
+    except Exception as e:
+        st.error(f"Could not load latest saved month: {e}")
+
+# Manage files area
+with st.expander("Upload New File or Manage Stored Months", expanded=False):
     uploaded_file = st.file_uploader("Choose full purchases CSV", type=["csv"])
 
     if uploaded_file is not None:
@@ -224,45 +234,41 @@ if source_choice == "Upload new monthly file":
                 else:
                     saved_path = save_month_file(uploaded_file.name, raw_file_bytes, month_to_save.strip())
                     st.success(f"Saved monthly file: {saved_path.name}")
+                    st.rerun()
 
-elif source_choice == "Use a stored month":
+    st.markdown("### Stored Months")
     saved_files = list_saved_month_files()
 
     if not saved_files:
-        st.info("No saved month files found yet.")
+        st.write("No stored month files yet.")
     else:
         saved_labels = [f.name for f in saved_files]
         chosen_file = st.selectbox("Choose a stored month file", saved_labels)
 
         if chosen_file:
             selected_saved_path = SAVED_MONTHS_DIR / chosen_file
-            with open(selected_saved_path, "rb") as f:
-                raw_df = read_full_uplift_csv(f)
-            raw_source_name = selected_saved_path.name
 
-            col_load, col_delete = st.columns([3, 1])
+            col_load, col_delete = st.columns([1, 1])
 
             with col_load:
-                st.success(f"Loaded stored month: {chosen_file}")
+                if st.button("Load Selected Month"):
+                    try:
+                        with open(selected_saved_path, "rb") as f:
+                            raw_df = read_full_uplift_csv(f)
+                        raw_source_name = selected_saved_path.name
+                        st.success(f"Loaded stored month: {chosen_file}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not load file: {e}")
 
             with col_delete:
-                delete_key = f"delete_{chosen_file}"
-                if st.button("Delete This Month", key=delete_key):
+                if st.button("Delete This Month", key=f"delete_{chosen_file}"):
                     try:
                         os.remove(selected_saved_path)
                         st.success(f"Deleted {chosen_file}")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Could not delete file: {e}")
-
-
-with st.expander("Stored Months", expanded=False):
-    saved_files = list_saved_month_files()
-    if not saved_files:
-        st.write("No stored month files yet.")
-    else:
-        stored_df = pd.DataFrame({"Saved File": [f.name for f in saved_files]})
-        st.dataframe(stored_df, use_container_width=True)
 
 
 # =========================================================
@@ -332,7 +338,7 @@ if raw_df is not None:
         st.warning(f"Unknown Broker Codes Found: {', '.join(unknown_codes)}")
 
         with st.expander("Add Missing Broker Codes", expanded=False):
-            st.write("Enter broker company names for the missing codes below. Then download the CSV snippet and add those rows to `broker_map.csv` in GitHub.")
+            st.write("Enter broker company names for the missing codes below. Then download the CSV snippet and add those rows to broker_map.csv in GitHub.")
 
             missing_broker_rows = []
             for code in unknown_codes:
@@ -343,7 +349,6 @@ if raw_df is not None:
                 })
 
             missing_broker_df = pd.DataFrame(missing_broker_rows)
-
             st.dataframe(missing_broker_df, use_container_width=True)
 
             st.download_button(
@@ -809,4 +814,4 @@ if raw_df is not None:
         st.dataframe(working, use_container_width=True)
 
 else:
-    st.info("Upload a full monthly purchases CSV or choose a stored month to begin.")
+    st.info("No saved month found yet. Open the menu above and upload a monthly purchases CSV, then save it.")
