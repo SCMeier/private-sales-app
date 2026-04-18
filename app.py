@@ -226,7 +226,8 @@ elif source_choice == "Use a stored month":
 
         if chosen_file:
             selected_saved_path = SAVED_MONTHS_DIR / chosen_file
-            raw_df = read_full_uplift_csv(open(selected_saved_path, "rb"))
+            with open(selected_saved_path, "rb") as f:
+                raw_df = read_full_uplift_csv(f)
             raw_source_name = selected_saved_path.name
 
             col_load, col_delete = st.columns([3, 1])
@@ -273,7 +274,6 @@ if raw_df is not None:
 
     working = pv_df.copy()
 
-    # Normalize columns
     for col in ["Quantity", "BoxOffice", "Overs", "Flipper Fee", "UF Ticket Fee"]:
         if col in working.columns:
             working[col] = to_number(working[col])
@@ -292,12 +292,10 @@ if raw_df is not None:
     working["Event Name"] = working["Event Name"].fillna("").astype(str).str.strip()
     working["Purchased"] = working["Purchased"].fillna("").astype(str).str.strip()
 
-    # Parse private-sales fields
     working["Paid Per Ticket"] = working["Event Name"].apply(get_paid_amount)
     working["Broker Code"] = working["Event Name"].apply(get_broker_code)
     working["Total Paid to Flipper"] = working["Quantity"] * working["Paid Per Ticket"]
 
-    # Broker company lookup
     broker_lookup = {}
     if not broker_map_df.empty:
         broker_lookup = dict(
@@ -309,7 +307,6 @@ if raw_df is not None:
 
     working["Broker Company"] = working["Broker Code"].map(broker_lookup).fillna("")
 
-    # Build event-level defaults
     event_defaults = (
         working.groupby("Event Name", dropna=False)
         .agg(
@@ -325,7 +322,6 @@ if raw_df is not None:
         })
     )
 
-    # Event reference state
     default_event_ref = event_defaults.copy()
     default_event_ref["Broker Fee %"] = 5.0
     default_event_ref["Account"] = "Flipper"
@@ -359,7 +355,6 @@ if raw_df is not None:
             add_rows = default_event_ref[default_event_ref["Event Name"].astype(str).isin(missing_events)].copy()
             current_ref = pd.concat([current_ref, add_rows], ignore_index=True)
 
-        # refresh broker/date defaults for existing rows without wiping manual overrides
         current_ref = current_ref.merge(
             default_event_ref[["Event Name", "Broker Code", "Broker Company", "Sales Date"]],
             on="Event Name",
@@ -425,7 +420,6 @@ if raw_df is not None:
 
     st.session_state.event_ref_data = edited_event_ref.copy()
 
-    # Merge event control data back in
     working = working.merge(
         st.session_state.event_ref_data,
         on="Event Name",
@@ -433,7 +427,6 @@ if raw_df is not None:
         suffixes=("", "_event")
     )
 
-    # Event summary
     event_summary = (
         working.groupby("Event Name", dropna=False)
         .agg(
@@ -517,7 +510,6 @@ if raw_df is not None:
         ignore_index=True
     )
 
-    # Flipper summary
     flipper_summary = (
         working.groupby(["Flipper Name", "Event Name"], dropna=False)
         .agg(
@@ -537,7 +529,6 @@ if raw_df is not None:
         "Total_Paid_To_Flipper": "Total Paid to Flipper",
     })
 
-    # PO Summary
     purchase_id_col = find_purchase_id_column(working)
     po_summary = pd.DataFrame()
 
@@ -567,7 +558,9 @@ if raw_df is not None:
             "Amount_Paid": "Amount Paid",
         })
 
-    # Broker summary
+    # =========================================================
+    # BROKER SUMMARY (FIXED)
+    # =========================================================
     broker_summary = (
         working.groupby(["Broker Code_event", "Broker Company_event"], dropna=False)
         .agg(
@@ -582,11 +575,8 @@ if raw_df is not None:
         .reset_index()
     )
 
-    broker_summary["Broker Fees"] = 0.0
-
-    event_fees_for_broker = event_summary_display[["Broker Code", "Broker Company", "Broker Fees", "Total Company Profit"]].copy()
     broker_fees_grouped = (
-        event_fees_for_broker.groupby(["Broker Code", "Broker Company"], dropna=False)
+        event_summary_display.groupby(["Broker Code", "Broker Company"], dropna=False)
         .agg(
             Broker_Fees=("Broker Fees", "sum"),
             Total_Company_Profit=("Total Company Profit", "sum"),
@@ -600,6 +590,8 @@ if raw_df is not None:
         right_on=["Broker Code", "Broker Company"],
         how="left"
     )
+
+    broker_summary = broker_summary.drop(columns=["Broker Code", "Broker Company"])
 
     broker_summary = broker_summary.rename(columns={
         "Broker Code_event": "Broker Code",
@@ -629,7 +621,6 @@ if raw_df is not None:
 
     broker_summary = broker_summary.fillna("")
 
-    # Clean detail
     detail_cols = []
     for col in [
         "Event Name",
@@ -654,7 +645,6 @@ if raw_df is not None:
 
     clean_detail = working[detail_cols].copy()
     clean_detail = clean_detail.rename(columns={
-        "Purchased": "Purchased",
         "Broker Code_event": "Broker Code",
         "Broker Company_event": "Broker Company",
     })
@@ -683,7 +673,6 @@ if raw_df is not None:
     ]
     clean_detail = clean_detail[[c for c in ordered_cols if c in clean_detail.columns]].copy()
 
-    # Dashboard
     st.markdown("### Dashboard Totals")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total BoxOffice", f"{event_summary_display['Total BoxOffice'].sum():,.2f}")
@@ -692,7 +681,6 @@ if raw_df is not None:
     c4.metric("Flipper Fees", f"{event_summary_display['Flipper Fees'].sum():,.2f}")
     c5.metric("Company Profit", f"{event_summary_display['Total Company Profit'].sum():,.2f}")
 
-    # Downloads
     st.markdown("### Download Files")
     d1, d2, d3, d4, d5 = st.columns(5)
 
@@ -744,7 +732,6 @@ if raw_df is not None:
         mime="text/csv"
     )
 
-    # Tables
     st.markdown("### Event Summary")
     st.dataframe(event_summary_download, use_container_width=True)
 
