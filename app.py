@@ -1,26 +1,14 @@
-import io
-import os
 import re
+import io
+import csv
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
+import pandas as pd
 
-st.set_page_config(page_title="Private Sales App", layout="wide")
 
-APP_TITLE = "Private Sales App"
-SAVED_MONTHS_DIR = Path("saved_months")
+DATA_FILE = Path("private_sales_latest.csv")
 BROKER_MAP_FILE = Path("broker_map.csv")
-
-st.title(APP_TITLE)
-st.write("Private Sales dashboard. The app auto-loads the latest saved month if one exists.")
-
-
-# =========================================================
-# HELPERS
-# =========================================================
-def ensure_saved_months_dir():
-    SAVED_MONTHS_DIR.mkdir(exist_ok=True)
 
 
 def to_number(series):
@@ -32,23 +20,8 @@ def to_number(series):
     return pd.to_numeric(s, errors="coerce").fillna(0.0)
 
 
-def df_to_csv_download(df):
-    return df.to_csv(index=False).encode("utf-8")
-
-
-def sanitize_filename(text):
-    text = str(text).strip()
-    text = re.sub(r"[^\w\-]+", "_", text)
-    text = re.sub(r"_+", "_", text).strip("_")
-    return text or "saved_file"
-
-
 def get_paid_amount(event_name):
-    """
-    PV3 SHCL -> 3
-    PV5 TTABC-Event -> 5
-    """
-    match = re.search(r"^PV\s*(\d+)", str(event_name).upper().strip())
+    match = re.search(r"PV\s*(\d+)", str(event_name).upper())
     if match:
         return float(match.group(1))
     return 0.0
@@ -58,10 +31,9 @@ def get_broker_code(event_name):
     """
     Rule:
     Use the FIRST 2 letters after PV#.
-
-    Examples:
+    Example:
     PV3 SHCL -> SH
-    PV5 TTABC-Event -> TT
+    PV5 TTSEB -> TT
     """
     text = str(event_name).upper().strip()
     match = re.search(r"^PV\s*\d+\s*([A-Z]{2})", text)
@@ -91,52 +63,53 @@ def find_purchase_id_column(df):
     return None
 
 
-def load_broker_map():
-    if not BROKER_MAP_FILE.exists():
-        return pd.DataFrame(columns=["Broker Company", "Broker Code"])
-
-    broker_map = pd.read_csv(BROKER_MAP_FILE, dtype=str).fillna("")
-    broker_map.columns = [str(c).strip() for c in broker_map.columns]
-
-    expected = {"Broker Company", "Broker Code"}
-    if not expected.issubset(set(broker_map.columns)):
-        return pd.DataFrame(columns=["Broker Company", "Broker Code"])
-
-    broker_map["Broker Company"] = broker_map["Broker Company"].astype(str).str.strip()
-    broker_map["Broker Code"] = broker_map["Broker Code"].astype(str).str.strip().str.upper()
-
-    broker_map = broker_map[broker_map["Broker Code"] != ""].copy()
-    broker_map = broker_map.drop_duplicates(subset=["Broker Code"], keep="first").reset_index(drop=True)
-    return broker_map
+def df_to_csv_download(df):
+    return df.to_csv(index=False).encode("utf-8")
 
 
-def read_full_uplift_csv(file_obj):
-    """
-    Uflip export may have summary/junk rows before the real table.
-    Find the header row that contains Event Name and read from there.
-    """
-    raw = file_obj.read()
-
-    if isinstance(raw, bytes):
-        text = raw.decode("utf-8-sig", errors="replace")
+def read_uploaded_text(path_or_buffer):
+    if hasattr(path_or_buffer, "read"):
+        raw = path_or_buffer.read()
     else:
-        text = str(raw)
+        with open(path_or_buffer, "rb") as f:
+            raw = f.read()
+
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin1"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    raise ValueError("Could not decode CSV file.")
+
+
+def find_detail_header_line(text):
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        first_cell = next(csv.reader([line], skipinitialspace=False), [])
+        if not first_cell:
+            continue
+        first_val = str(first_cell[0]).strip().strip('"')
+        if first_val == "Id":
+            return i
+    return None
+
+
+def load_full_csv(path_or_buffer):
+    text = read_uploaded_text(path_or_buffer)
+    header_line_idx = find_detail_header_line(text)
+    if header_line_idx is None:
+        raise ValueError("Could not find the detail section. Expected a row starting with 'Id'.")
 
     lines = text.splitlines()
+    detail_text = "\n".join(lines[header_line_idx:])
 
-    header_idx = None
-    for i, line in enumerate(lines):
-        if "Event Name" in line and "," in line:
-            header_idx = i
-            break
+    try:
+        df = pd.read_csv(io.StringIO(detail_text))
+    except Exception as e:
+        raise ValueError(f"Could not read detail section: {e}")
 
-    if header_idx is None:
-        raise ValueError("Could not find the detail table header row containing 'Event Name'.")
-
-    csv_text = "\n".join(lines[header_idx:])
-    df = pd.read_csv(io.StringIO(csv_text), dtype=str)
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
+    df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed:")]
+    return df, header_line_idx + 1
 
 
 def filter_private_sales(df):
@@ -146,258 +119,135 @@ def filter_private_sales(df):
     working = df.copy()
     working["Event Name"] = working["Event Name"].fillna("").astype(str).str.strip()
 
-    pv_df = working[working["Event Name"].str.upper().str.startswith("PV")].copy()
+    pv_df = working[
+        working["Event Name"].str.upper().str.startswith("PV", na=False)
+    ].copy()
+
     return pv_df
 
 
-def list_saved_month_files():
-    ensure_saved_months_dir()
-    return sorted(SAVED_MONTHS_DIR.glob("*.csv"))
+def load_broker_map():
+    if not BROKER_MAP_FILE.exists():
+        return {}
+
+    broker_map = pd.read_csv(BROKER_MAP_FILE, dtype=str).fillna("")
+    broker_map.columns = [str(c).strip() for c in broker_map.columns]
+
+    if "Broker Company" not in broker_map.columns or "Broker Code" not in broker_map.columns:
+        return {}
+
+    broker_map["Broker Company"] = broker_map["Broker Company"].astype(str).str.strip()
+    broker_map["Broker Code"] = broker_map["Broker Code"].astype(str).str.strip().str.upper()
+
+    broker_map = broker_map[broker_map["Broker Code"] != ""].copy()
+    broker_map = broker_map.drop_duplicates(subset=["Broker Code"], keep="first")
+
+    return dict(zip(broker_map["Broker Code"], broker_map["Broker Company"]))
 
 
-def save_month_file(uploaded_name, file_bytes, month_label):
-    ensure_saved_months_dir()
-    safe_month = sanitize_filename(month_label)
-    safe_orig = sanitize_filename(Path(uploaded_name).stem)
-    filename = f"{safe_month}__{safe_orig}.csv"
-    save_path = SAVED_MONTHS_DIR / filename
-
-    with open(save_path, "wb") as f:
-        f.write(file_bytes)
-
-    return save_path
+def calc_profit_pct(total_profit, total_boxoffice):
+    if total_boxoffice == 0:
+        return 0.0
+    return total_profit / total_boxoffice
 
 
-def month_label_from_df(df):
-    if "Purchased" in df.columns:
-        purchased = df["Purchased"].fillna("").astype(str).str.strip()
-        parsed = pd.to_datetime(purchased, errors="coerce")
-        parsed = parsed.dropna()
-        if not parsed.empty:
-            return parsed.iloc[0].strftime("%Y-%m")
-    return ""
+def render():
+    st.set_page_config(page_title="Private Sales App", layout="wide")
 
+    st.title("Private Sales App")
+    st.write("This app auto-loads the latest Private Sales CSV from GitHub and keeps only rows whose Event Name starts with PV.")
 
-def calc_profit_pct(profit_series, boxoffice_series):
-    profit = pd.to_numeric(profit_series, errors="coerce").fillna(0.0)
-    box = pd.to_numeric(boxoffice_series, errors="coerce").fillna(0.0)
-    result = pd.Series(0.0, index=box.index if hasattr(box, "index") else None)
-    nonzero = box != 0
-    result.loc[nonzero] = profit.loc[nonzero] / box.loc[nonzero]
-    return result
-
-
-# =========================================================
-# INITIAL LOAD
-# =========================================================
-ensure_saved_months_dir()
-broker_map_df = load_broker_map()
-
-raw_df = None
-raw_source_name = None
-
-saved_files = list_saved_month_files()
-
-# Auto-load latest saved month first
-if saved_files:
-    latest_file = saved_files[-1]
-    latest_path = SAVED_MONTHS_DIR / latest_file.name
-
-    try:
-        with open(latest_path, "rb") as f:
-            raw_df = read_full_uplift_csv(f)
-        raw_source_name = latest_file.name
-        st.success(f"Auto-loaded latest saved month: {latest_file.name}")
-    except Exception as e:
-        st.error(f"Could not load latest saved month: {e}")
-
-# Manage files area
-with st.expander("Upload New File or Manage Stored Months", expanded=False):
-    uploaded_file = st.file_uploader("Choose full purchases CSV", type=["csv"])
-
-    if uploaded_file is not None:
-        raw_file_bytes = uploaded_file.getvalue()
-        raw_df = read_full_uplift_csv(io.BytesIO(raw_file_bytes))
-        raw_source_name = uploaded_file.name
-
-        default_month = month_label_from_df(raw_df)
-        month_to_save = st.text_input(
-            "Month label for saving this file",
-            value=default_month if default_month else ""
-        )
-
-        col_save_1, col_save_2 = st.columns([1, 4])
-        with col_save_1:
-            if st.button("Save This Month File"):
-                if month_to_save.strip() == "":
-                    st.error("Enter a month label like 2026-04 before saving.")
-                else:
-                    saved_path = save_month_file(uploaded_file.name, raw_file_bytes, month_to_save.strip())
-                    st.success(f"Saved monthly file: {saved_path.name}")
-                    st.rerun()
-
-    st.markdown("### Stored Months")
-    saved_files = list_saved_month_files()
-
-    if not saved_files:
-        st.write("No stored month files yet.")
-    else:
-        saved_labels = [f.name for f in saved_files]
-        chosen_file = st.selectbox("Choose a stored month file", saved_labels)
-
-        if chosen_file:
-            selected_saved_path = SAVED_MONTHS_DIR / chosen_file
-
-            col_load, col_delete = st.columns([1, 1])
-
-            with col_load:
-                if st.button("Load Selected Month"):
-                    try:
-                        with open(selected_saved_path, "rb") as f:
-                            raw_df = read_full_uplift_csv(f)
-                        raw_source_name = selected_saved_path.name
-                        st.success(f"Loaded stored month: {chosen_file}")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Could not load file: {e}")
-
-            with col_delete:
-                if st.button("Delete This Month", key=f"delete_{chosen_file}"):
-                    try:
-                        os.remove(selected_saved_path)
-                        st.success(f"Deleted {chosen_file}")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Could not delete file: {e}")
-
-
-# =========================================================
-# MAIN PROCESSING
-# =========================================================
-if raw_df is not None:
-    st.info(f"Source file: {raw_source_name}")
-
-    pv_df = filter_private_sales(raw_df)
-
-    if pv_df.empty:
-        st.warning("No rows found where Event Name starts with PV.")
+    if not DATA_FILE.exists():
+        st.error("private_sales_latest.csv was not found in the GitHub repo.")
         st.stop()
 
-    working = pv_df.copy()
+    try:
+        df, start_line = load_full_csv(DATA_FILE)
+        total_detail_rows = len(df)
+        df = filter_private_sales(df)
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
-    # Normalize numeric columns
-    for col in ["Quantity", "BoxOffice", "Overs", "Flipper Fee", "UF Ticket Fee"]:
-        if col in working.columns:
-            working[col] = to_number(working[col])
-        else:
-            working[col] = 0.0
+    st.success(f"Latest file loaded successfully. Detail section found starting at line {start_line}.")
+    st.write(f"Total detail rows found: {total_detail_rows:,}")
+    st.write(f"PV rows kept: {len(df):,}")
 
-    # Ensure required columns exist
-    if "Flipper Name" not in working.columns:
-        working["Flipper Name"] = ""
+    if df.empty:
+        st.warning("No rows were found where Event Name starts with PV.")
+        st.stop()
 
-    if "Order No" not in working.columns:
-        working["Order No"] = ""
-
-    if "Purchased" not in working.columns:
-        working["Purchased"] = ""
-
-    working["Event Name"] = working["Event Name"].fillna("").astype(str).str.strip()
-    working["Purchased"] = working["Purchased"].fillna("").astype(str).str.strip()
-
-    # Parse PV info
-    working["Paid Per Ticket"] = working["Event Name"].apply(get_paid_amount)
-    working["Broker Code"] = working["Event Name"].apply(get_broker_code)
-    working["Total Paid to Flipper"] = working["Quantity"] * working["Paid Per Ticket"]
-
-    # Broker lookup
-    broker_lookup = {}
-    if not broker_map_df.empty:
-        broker_lookup = dict(
-            zip(
-                broker_map_df["Broker Code"].astype(str).str.upper(),
-                broker_map_df["Broker Company"].astype(str).str.strip()
-            )
-        )
-
-    working["Broker Company"] = working["Broker Code"].map(broker_lookup)
-    working["Broker Company"] = working["Broker Company"].fillna("UNKNOWN")
-
-    # Unknown broker warning
-    unknown_codes = sorted(
-        set(
-            working.loc[working["Broker Company"] == "UNKNOWN", "Broker Code"]
-            .fillna("")
-            .astype(str)
-            .str.strip()
-            .tolist()
-        ) - {""}
-    )
-
-    if unknown_codes:
-        st.warning(f"Unknown Broker Codes Found: {', '.join(unknown_codes)}")
-
-        with st.expander("Add Missing Broker Codes", expanded=False):
-            st.write("Enter broker company names for the missing codes below. Then download the CSV snippet and add those rows to broker_map.csv in GitHub.")
-
-            missing_broker_rows = []
-            for code in unknown_codes:
-                company_name = st.text_input(f"Broker company for code {code}", key=f"missing_broker_{code}")
-                missing_broker_rows.append({
-                    "Broker Company": company_name.strip(),
-                    "Broker Code": code
-                })
-
-            missing_broker_df = pd.DataFrame(missing_broker_rows)
-            st.dataframe(missing_broker_df, use_container_width=True)
-
-            st.download_button(
-                "Download Missing Broker CSV",
-                data=df_to_csv_download(missing_broker_df),
-                file_name="missing_broker_codes.csv",
-                mime="text/csv"
-            )
-
-    # Event defaults
-    event_defaults = (
-        working.groupby("Event Name", dropna=False)
-        .agg(
-            Broker_Code=("Broker Code", "first"),
-            Broker_Company=("Broker Company", "first"),
-            Sales_Date=("Purchased", "first"),
-        )
-        .reset_index()
-        .rename(columns={
-            "Broker_Code": "Broker Code",
-            "Broker_Company": "Broker Company",
-            "Sales_Date": "Sales Date",
-        })
-    )
-
-    default_event_ref = event_defaults.copy()
-    default_event_ref["Broker Fee %"] = 5.0
-    default_event_ref["Account"] = "Flipper"
-
-    default_event_ref = default_event_ref[
-        [
-            "Event Name",
-            "Broker Code",
-            "Broker Company",
-            "Broker Fee %",
-            "Account",
-            "Sales Date",
-        ]
-    ].copy()
-
-    # Reset event control when file changes
-    current_signature = f"{raw_source_name}|{len(working)}|{working['Event Name'].nunique()}"
-    if st.session_state.get("source_signature") != current_signature:
-        st.session_state.source_signature = current_signature
-        st.session_state.event_ref_data = default_event_ref.copy()
+    broker_lookup = load_broker_map()
 
     st.subheader("Private Sales Dashboard")
 
+    event_list = sorted(df["Event Name"].dropna().astype(str).unique().tolist())
+
+    if "event_ref_data" not in st.session_state:
+        defaults = []
+        for event_name in event_list:
+            broker_code = get_broker_code(event_name)
+            broker_company = broker_lookup.get(broker_code, "UNKNOWN")
+            defaults.append({
+                "Event Name": event_name,
+                "Broker Code": broker_code,
+                "Broker Company": broker_company,
+                "Broker Fee %": 5.0,
+                "Account": "Flipper",
+                "Sales Date": "",
+            })
+        st.session_state.event_ref_data = pd.DataFrame(defaults)
+    else:
+        existing = st.session_state.event_ref_data.copy()
+        if "Event Name" not in existing.columns:
+            existing = pd.DataFrame(columns=["Event Name", "Broker Code", "Broker Company", "Broker Fee %", "Account", "Sales Date"])
+
+        existing_events = set(existing["Event Name"].astype(str))
+        missing_events = [e for e in event_list if e not in existing_events]
+
+        if missing_events:
+            add_rows = []
+            for event_name in missing_events:
+                broker_code = get_broker_code(event_name)
+                broker_company = broker_lookup.get(broker_code, "UNKNOWN")
+                add_rows.append({
+                    "Event Name": event_name,
+                    "Broker Code": broker_code,
+                    "Broker Company": broker_company,
+                    "Broker Fee %": 5.0,
+                    "Account": "Flipper",
+                    "Sales Date": "",
+                })
+            add_df = pd.DataFrame(add_rows)
+            st.session_state.event_ref_data = pd.concat([existing, add_df], ignore_index=True)
+
+        st.session_state.event_ref_data = st.session_state.event_ref_data[
+            st.session_state.event_ref_data["Event Name"].astype(str).isin(set(event_list))
+        ].copy()
+
+    # update broker code/company defaults from current map without touching manual fee/account
+    refreshed_rows = []
+    for _, row in st.session_state.event_ref_data.iterrows():
+        event_name = str(row["Event Name"])
+        broker_code = get_broker_code(event_name)
+        current_company = str(row.get("Broker Company", "")).strip()
+        mapped_company = broker_lookup.get(broker_code, "UNKNOWN")
+        if current_company == "" or current_company == "UNKNOWN":
+            current_company = mapped_company
+
+        refreshed_rows.append({
+            "Event Name": event_name,
+            "Broker Code": broker_code,
+            "Broker Company": current_company,
+            "Broker Fee %": row.get("Broker Fee %", 5.0),
+            "Account": row.get("Account", "Flipper"),
+            "Sales Date": row.get("Sales Date", ""),
+        })
+
+    st.session_state.event_ref_data = pd.DataFrame(refreshed_rows)
+
     st.markdown("### Event Control")
+
     event_ref_for_edit = st.session_state.event_ref_data.copy()
     event_ref_for_edit["Broker Fee %"] = pd.to_numeric(
         event_ref_for_edit["Broker Fee %"], errors="coerce"
@@ -429,22 +279,84 @@ if raw_df is not None:
 
     st.session_state.event_ref_data = edited_event_ref.copy()
 
-    # Merge event controls back
+    working = df.copy()
+
+    for col in ["Quantity", "BoxOffice", "Overs", "Flipper Fee", "UF Ticket Fee"]:
+        if col in working.columns:
+            working[col] = to_number(working[col])
+        else:
+            working[col] = 0.0
+
+    if "Order No" not in working.columns:
+        working["Order No"] = ""
+
+    if "Flipper Name" not in working.columns:
+        working["Flipper Name"] = ""
+
+    if "Purchased" not in working.columns:
+        working["Purchased"] = ""
+
+    working["Broker Code"] = working["Event Name"].apply(get_broker_code)
+    working["Broker Company"] = working["Broker Code"].map(broker_lookup).fillna("UNKNOWN")
+    working["Paid Per Ticket"] = working["Event Name"].apply(get_paid_amount)
+    working["Total Paid to Flipper"] = working["Quantity"] * working["Paid Per Ticket"]
+
+    unknown_codes = sorted(
+        set(
+            working.loc[working["Broker Company"] == "UNKNOWN", "Broker Code"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .tolist()
+        ) - {""}
+    )
+
+    if unknown_codes:
+        st.warning(f"Unknown Broker Codes Found: {', '.join(unknown_codes)}")
+
+        with st.expander("Add Missing Broker Codes", expanded=False):
+            st.write("Enter broker company names for the missing codes below, then download the CSV snippet and add those rows to broker_map.csv in GitHub.")
+
+            missing_rows = []
+            for code in unknown_codes:
+                company_name = st.text_input(f"Broker company for code {code}", key=f"missing_broker_{code}")
+                missing_rows.append({
+                    "Broker Company": company_name.strip(),
+                    "Broker Code": code
+                })
+
+            missing_df = pd.DataFrame(missing_rows)
+            st.dataframe(missing_df, use_container_width=True)
+
+            st.download_button(
+                "Download Missing Broker CSV",
+                data=df_to_csv_download(missing_df),
+                file_name="missing_broker_codes.csv",
+                mime="text/csv"
+            )
+
+    # merge control table
     working = working.merge(
         st.session_state.event_ref_data,
         on="Event Name",
         how="left",
-        suffixes=("", "_event")
+        suffixes=("", "_control")
     )
 
-    # =========================================================
-    # EVENT SUMMARY
-    # =========================================================
+    # fill date from Purchased if Sales Date blank
+    if "Sales Date" in working.columns and "Purchased" in working.columns:
+        working["Sales Date"] = working["Sales Date"].fillna("").astype(str)
+        working["Purchased"] = working["Purchased"].fillna("").astype(str)
+        working["Sales Date"] = working.apply(
+            lambda r: r["Purchased"] if str(r["Sales Date"]).strip() == "" else r["Sales Date"],
+            axis=1
+        )
+
     event_summary = (
         working.groupby("Event Name", dropna=False)
         .agg(
-            Broker_Code=("Broker Code_event", "first"),
-            Broker_Company=("Broker Company_event", "first"),
+            Broker_Code=("Broker Code_control", "first"),
+            Broker_Company=("Broker Company_control", "first"),
             Broker_Fee_Pct=("Broker Fee %", "first"),
             Account=("Account", "first"),
             Sales_Date=("Sales Date", "first"),
@@ -463,7 +375,7 @@ if raw_df is not None:
     ).fillna(5.0)
 
     event_summary["Broker Fees"] = (
-        event_summary["Total_BoxOffice"] * event_summary["Broker_Fee_Pct"] / 100.0
+        event_summary["Total_BoxOffice"] * event_summary["Broker_Fee_Pct"] / 100
     )
 
     event_summary["Total Company Profit"] = (
@@ -472,9 +384,8 @@ if raw_df is not None:
         - event_summary["Flipper_Fees"]
     )
 
-    event_summary["Profit %"] = calc_profit_pct(
-        event_summary["Total Company Profit"],
-        event_summary["Total_BoxOffice"]
+    event_summary["Profit %"] = event_summary.apply(
+        lambda r: calc_profit_pct(r["Total Company Profit"], r["Total_BoxOffice"]), axis=1
     )
 
     event_summary = event_summary.rename(columns={
@@ -509,7 +420,7 @@ if raw_df is not None:
 
     total_boxoffice = event_summary_display["Total BoxOffice"].sum()
     total_profit = event_summary_display["Total Company Profit"].sum()
-    grand_profit_pct = (total_profit / total_boxoffice) if total_boxoffice != 0 else 0.0
+    grand_profit_pct = calc_profit_pct(total_profit, total_boxoffice)
 
     totals_row = pd.DataFrame([{
         "Event Name": "GRAND TOTAL",
@@ -534,14 +445,11 @@ if raw_df is not None:
         ignore_index=True
     )
 
-    # =========================================================
-    # FLIPPER SUMMARY
-    # =========================================================
     flipper_summary = (
         working.groupby(["Flipper Name", "Event Name"], dropna=False)
         .agg(
-            Broker_Code=("Broker Code_event", "first"),
-            Broker_Company=("Broker Company_event", "first"),
+            Broker_Code=("Broker Code_control", "first"),
+            Broker_Company=("Broker Company_control", "first"),
             Quantity=("Quantity", "sum"),
             Paid_Per_Ticket=("Paid Per Ticket", "max"),
             Total_Paid_To_Flipper=("Total Paid to Flipper", "sum"),
@@ -556,9 +464,6 @@ if raw_df is not None:
         "Total_Paid_To_Flipper": "Total Paid to Flipper",
     })
 
-    # =========================================================
-    # PO SUMMARY
-    # =========================================================
     purchase_id_col = find_purchase_id_column(working)
     po_summary = pd.DataFrame()
 
@@ -571,8 +476,8 @@ if raw_df is not None:
             po_working.groupby(purchase_id_col, dropna=False)
             .agg(
                 Event_Name=("Event Name", "first"),
-                Broker_Code=("Broker Code_event", "first"),
-                Broker_Company=("Broker Company_event", "first"),
+                Broker_Code=("Broker Code_control", "first"),
+                Broker_Company=("Broker Company_control", "first"),
                 Flipper_Name=("Flipper Name", "first"),
                 Amount_Paid=("Paid Per Ticket", "first"),
             )
@@ -588,11 +493,8 @@ if raw_df is not None:
             "Amount_Paid": "Amount Paid",
         })
 
-    # =========================================================
-    # BROKER SUMMARY
-    # =========================================================
     broker_summary_base = (
-        working.groupby(["Broker Code_event", "Broker Company_event"], dropna=False)
+        working.groupby(["Broker Code_control", "Broker Company_control"], dropna=False)
         .agg(
             Events=("Event Name", "nunique"),
             Orders=("Order No", "nunique"),
@@ -604,8 +506,8 @@ if raw_df is not None:
         )
         .reset_index()
         .rename(columns={
-            "Broker Code_event": "Broker Code",
-            "Broker Company_event": "Broker Company",
+            "Broker Code_control": "Broker Code",
+            "Broker Company_control": "Broker Company",
             "Total_BoxOffice": "Total BoxOffice",
             "Flipper_Fees": "Flipper Fees",
             "UF_Ticket_Fee": "UF Ticket Fee",
@@ -631,9 +533,8 @@ if raw_df is not None:
         how="left"
     )
 
-    broker_summary["Profit %"] = calc_profit_pct(
-        broker_summary["Total Company Profit"],
-        broker_summary["Total BoxOffice"]
+    broker_summary["Profit %"] = broker_summary.apply(
+        lambda r: calc_profit_pct(r["Total Company Profit"], r["Total BoxOffice"]), axis=1
     )
 
     broker_summary = broker_summary[
@@ -655,48 +556,46 @@ if raw_df is not None:
 
     broker_summary = broker_summary.fillna("")
 
-    # =========================================================
-    # CLEAN DETAIL
-    # =========================================================
-    detail_cols = []
+    detail_columns = []
     for col in [
         "Event Name",
         "Purchased",
-        "Flipper Name",
         "Quantity",
         "BoxOffice",
         "Overs",
         "Flipper Fee",
         "UF Ticket Fee",
+        "Flipper Name",
         "Order No",
         "Paid Per Ticket",
         "Total Paid to Flipper",
-        "Broker Code_event",
-        "Broker Company_event",
+        "Broker Code_control",
+        "Broker Company_control",
         "Broker Fee %",
         "Account",
         "Sales Date",
     ]:
         if col in working.columns:
-            detail_cols.append(col)
+            detail_columns.append(col)
 
-    clean_detail = working[detail_cols].copy()
+    clean_detail = working[detail_columns].copy()
+
     clean_detail = clean_detail.rename(columns={
-        "Broker Code_event": "Broker Code",
-        "Broker Company_event": "Broker Company",
+        "Broker Code_control": "Broker Code",
+        "Broker Company_control": "Broker Company",
     })
 
     if purchase_id_col is not None and purchase_id_col in working.columns:
-        clean_detail["Purchase ID"] = working[purchase_id_col]
+        clean_detail[purchase_id_col] = working[purchase_id_col]
 
-    ordered_cols = [
+    clean_detail_columns_order = [
         "Event Name",
-        "Purchased",
-        "Sales Date",
         "Broker Code",
         "Broker Company",
         "Broker Fee %",
         "Account",
+        "Sales Date",
+        "Purchased",
         "Flipper Name",
         "Quantity",
         "Paid Per Ticket",
@@ -706,31 +605,31 @@ if raw_df is not None:
         "Flipper Fee",
         "UF Ticket Fee",
         "Order No",
-        "Purchase ID",
     ]
-    clean_detail = clean_detail[[c for c in ordered_cols if c in clean_detail.columns]].copy()
 
-    # =========================================================
-    # DASHBOARD
-    # =========================================================
+    if purchase_id_col is not None and purchase_id_col in clean_detail.columns:
+        clean_detail_columns_order.append(purchase_id_col)
+
+    clean_detail = clean_detail[
+        [col for col in clean_detail_columns_order if col in clean_detail.columns]
+    ].copy()
+
     st.markdown("### Dashboard Totals")
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Total BoxOffice", f"{total_boxoffice:,.2f}")
-    c2.metric("Broker Fees", f"{event_summary_display['Broker Fees'].sum():,.2f}")
-    c3.metric("Overs", f"{event_summary_display['Overs'].sum():,.2f}")
-    c4.metric("Flipper Fees", f"{event_summary_display['Flipper Fees'].sum():,.2f}")
-    c5.metric("Company Profit", f"{total_profit:,.2f}")
-    c6.metric("Profit %", f"{grand_profit_pct:.2%}")
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
 
-    # =========================================================
-    # DOWNLOADS
-    # =========================================================
+    col1.metric("Total BoxOffice", f"{total_boxoffice:,.2f}")
+    col2.metric("Broker Fees", f"{event_summary_display['Broker Fees'].sum():,.2f}")
+    col3.metric("Overs", f"{event_summary_display['Overs'].sum():,.2f}")
+    col4.metric("Flipper Fees", f"{event_summary_display['Flipper Fees'].sum():,.2f}")
+    col5.metric("Company Profit", f"{total_profit:,.2f}")
+    col6.metric("Profit %", f"{grand_profit_pct:.2%}")
+
     st.markdown("### Download Files")
     d1, d2, d3, d4, d5 = st.columns(5)
 
     with d1:
         st.download_button(
-            "Download Event Control",
+            label="Download Event Control",
             data=df_to_csv_download(st.session_state.event_ref_data),
             file_name="event_control.csv",
             mime="text/csv"
@@ -738,7 +637,7 @@ if raw_df is not None:
 
     with d2:
         st.download_button(
-            "Download Event Summary",
+            label="Download Event Summary",
             data=df_to_csv_download(event_summary_download),
             file_name="event_summary.csv",
             mime="text/csv"
@@ -746,7 +645,7 @@ if raw_df is not None:
 
     with d3:
         st.download_button(
-            "Download Flipper Summary",
+            label="Download Flipper Summary",
             data=df_to_csv_download(flipper_summary),
             file_name="flipper_summary.csv",
             mime="text/csv"
@@ -755,7 +654,7 @@ if raw_df is not None:
     with d4:
         if not po_summary.empty:
             st.download_button(
-                "Download PO Summary",
+                label="Download PO Summary",
                 data=df_to_csv_download(po_summary),
                 file_name="po_summary.csv",
                 mime="text/csv"
@@ -763,22 +662,19 @@ if raw_df is not None:
 
     with d5:
         st.download_button(
-            "Download Broker Summary",
+            label="Download Broker Summary",
             data=df_to_csv_download(broker_summary),
             file_name="broker_summary.csv",
             mime="text/csv"
         )
 
     st.download_button(
-        "Download Clean Detail File",
+        label="Download Clean Detail File",
         data=df_to_csv_download(clean_detail),
         file_name="detail_clean.csv",
         mime="text/csv"
     )
 
-    # =========================================================
-    # TABLES
-    # =========================================================
     st.markdown("### Event Summary")
     st.dataframe(event_summary_download, use_container_width=True)
 
@@ -800,18 +696,31 @@ if raw_df is not None:
 
     st.markdown("### PO Summary")
     if not po_summary.empty:
-        po_cols = [c for c in ["Purchase ID", "Event Name", "Broker Code", "Broker Company", "Flipper Name", "Amount Paid"] if c in po_summary.columns]
-        st.dataframe(po_summary[po_cols], use_container_width=True)
+        st.dataframe(
+            po_summary[
+                [
+                    "Purchase ID",
+                    "Event Name",
+                    "Broker Code",
+                    "Broker Company",
+                    "Flipper Name",
+                    "Amount Paid",
+                ]
+            ],
+            use_container_width=True
+        )
     else:
         st.warning("No Purchase ID column was found in this CSV.")
 
     st.markdown("### Broker Summary")
     st.dataframe(broker_summary, use_container_width=True)
 
-    show_raw = st.checkbox("Show Raw PV Rows", value=False)
-    if show_raw:
-        st.markdown("### Raw PV Rows")
-        st.dataframe(working, use_container_width=True)
+    show_raw = st.checkbox("Show Raw PV Data Only", value=False, key="private_sales_show_raw")
 
-else:
-    st.info("No saved month found yet. Open the menu above and upload a monthly purchases CSV, then save it.")
+    if show_raw:
+        st.markdown("### Raw PV Data Only")
+        st.dataframe(df, use_container_width=True)
+
+
+if __name__ == "__main__":
+    render()
